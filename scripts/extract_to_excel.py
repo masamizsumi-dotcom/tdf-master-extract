@@ -25,7 +25,7 @@ from openpyxl.utils import get_column_letter
 
 HEADERS = [
     "ファイル名", "図番", "製品マーク", "設計符号", "サイズ", "本数",
-    "長さ", "重量", "左継手", "右継手", "種別", "製品段",
+    "長さ(m)", "重量", "左継手", "右継手", "種別", "製品段",
 ]
 
 _AXIS_TOLERANCE_DEG = 2.0
@@ -336,9 +336,11 @@ def main() -> None:
                 left, right = joints.get(id(row), (None, None))
                 if length_value is None:
                     left = right = None
+                # 記録はm単位(内部の判定ロジックはmm前提のまま、出力直前だけ変換)。
+                length_value_m = None if length_value is None else length_value / 1000.0
                 ws.append([
                     tdf_path.name, drawing_number, row.mark, row.design_code,
-                    row.size, row.count, length_value, row.weight, left, right,
+                    row.size, row.count, length_value_m, row.weight, left, right,
                     beam_types[id(row)], tier_label,
                 ])
                 total_rows += 1
