@@ -115,10 +115,12 @@ def compute_tier_info(rows: list) -> dict:
 # ある(実際の柱位置を示すラベルが別にあるため。ユーザー指摘により発見)。
 # 一方、継手コード自身は近傍に重複が無い。これを候補除外の条件にする。
 #
-# 数値のみのテキスト(寸法値等)は比較対象から除外する。取付ピッチ等の
-# 寸法値がたまたま継手コードの数字部分と部分一致してしまい、無関係な
-# 数値によって誤って除外されることがあったため
-# (例: "441"という寸法値が"TB441"に部分一致してしまう小梁側での検証で判明)。
+# 数値のみ(寸法値等)・1文字のみ(断面記号"A"/"B"等)のテキストは
+# 比較対象から除外する。前者は取付ピッチ等の寸法値がたまたま継手コードの
+# 数字部分と部分一致してしまうため(例: "441"が"TB441"に部分一致)、
+# 後者は断面記号の1文字が偶然コード名の末尾と一致してしまうため
+# (例: "A"が"B60A"に部分一致。小梁側で6行の誤爆が発生したことで判明、
+# 2026-09-15)。
 NEARBY_DUP_RANGE = 1000.0
 
 
@@ -131,8 +133,11 @@ def _has_nearby_duplicate(tdf, mx: float, my: float, text: str) -> bool:
         other = tdf.resolve_text(rec)
         if not other:
             continue
-        if other.strip().isdigit():
+        other_s = other.strip()
+        if other_s.isdigit():
             continue  # 寸法値等の純粋な数値は比較対象外
+        if len(other_s) < 2:
+            continue  # 断面記号等の1文字ラベルは偶然の部分一致を起こすため対象外
         if other == text or text in other or other in text:
             return True
     return False
@@ -168,11 +173,12 @@ def assign_joints_batch(tdf, rows: list, tier_info: dict, lengths: dict) -> dict
         near = [rec for rec in tdf.texts if abs(rec.x - mx) < 3 and abs(rec.y - my) < 3]
         for rec in near:
             t = tdf.resolve_text(rec)
-            if not t:
-                continue
-            if _has_nearby_duplicate(tdf, mx, my, t):
-                continue
-            candidates_raw.append((mx, my, t))
+            if t:
+                candidates_raw.append((mx, my, t))
+    # 柱マーク除外は製品長さがexm.SHORT_PRODUCT_THRESHOLD以上の場合のみ
+    # 適用する(短い製品は自己参照する左右の継手候補同士が近傍重複範囲内に
+    # 収まり、両方消えてしまう恐れがあるため。2026-09-15、ユーザー指摘)。
+    dup_flags = {(mx, my, t): _has_nearby_duplicate(tdf, mx, my, t) for mx, my, t in candidates_raw}
 
     claims: dict[tuple, tuple] = {}
     for key, members in groups.items():
@@ -189,6 +195,7 @@ def assign_joints_batch(tdf, rows: list, tier_info: dict, lengths: dict) -> dict
             return xr, yr
 
         threshold = max(length_value * 0.6, exm.JOINT_MIN_THRESHOLD)
+        apply_dup_exclusion = length_value >= exm.SHORT_PRODUCT_THRESHOLD
         for r in members:
             _tier_label, y_max = tier_info.get(id(r), (None, None))
             row_length = lengths.get(id(r))
@@ -208,6 +215,8 @@ def assign_joints_batch(tdf, rows: list, tier_info: dict, lengths: dict) -> dict
                 use_2d = False
             for mx, my, t in candidates_raw:
                 if my <= r.y or (y_max is not None and my >= y_max):
+                    continue
+                if apply_dup_exclusion and dup_flags[(mx, my, t)]:
                     continue
                 xr, yr = rotate(mx, my)
                 for side, ref in (("left", left_ref), ("right", right_ref)):
@@ -309,6 +318,13 @@ def main() -> None:
             # daiセルとは重複しないようにマージする(2026-09-14追加)。
             existing_dai_positions = {(round(r.x_next, 1), round(r.y, 1)) for r in rows}
             rows = rows + exm.find_product_rows_shared_group(tdf, existing_positions=existing_dai_positions)
+            # ×印(削除マーク)で削除された行を除外する(2026-09-15追加)。
+            # 従来この呼び出しが無く、WA2-1G-05の1G-X22Y4(削除済みのはずの
+            # 柱マーク行)が誤って残ってしまっていた。小梁側は元から
+            # 呼んでいたが、大梁側は「削除マークに遭遇したことが無い」という
+            # 理由で省略されていた不具合(ユーザー確認: 削除されるのが正しい
+            # 挙動で、これまで残っていたのが大梁コード側の不具合だった)。
+            rows = exm.filter_deleted_rows(tdf, rows)
             sort_rows(rows)
             tier_info = compute_tier_info(rows)
 

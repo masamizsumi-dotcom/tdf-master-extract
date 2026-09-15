@@ -67,6 +67,13 @@ _SHARED_CODE_Y_TOL = 2.0
 # 余裕を見て3000を採用する(2026-09-14)。
 JOINT_MIN_THRESHOLD = 3000.0
 
+# 柱マーク除外(_has_nearby_duplicate)を適用する製品長さの下限。これ未満の
+# 製品は、自己参照する左右の継手候補(同じテキストが左右の長丸に描かれる
+# ケース)同士が1000mm(NEARBY_DUP_RANGE)以内に収まってしまう恐れがあり、
+# 適用すると両方とも誤って除外されるリスクがあるため対象外とする
+# (2026-09-15、ユーザー指摘)。
+SHORT_PRODUCT_THRESHOLD = 2000.0
+
 
 def _is_axis_aligned(ln: tb.LineRecord) -> bool:
     ang = math.degrees(math.atan2(ln.y2 - ln.y1, ln.x2 - ln.x1)) % 180
@@ -321,6 +328,39 @@ def _find_reference_line_endpoints(tdf: tb.TdfData, x_min: float, x_max: float, 
     return (best.x2, best.y2), (best.x1, best.y1)
 
 
+# 長丸候補の周囲(上下左右1000mm以内)に同じ(部分一致含む)テキストが
+# 別途(円で囲まれていない形で)描かれている場合、柱マーク等の単なる
+# 参照ラベルとみなして継手候補から除外する(2026-09-15、大梁の`P441`
+# 柱マーク混入で確立したロジックを小梁にも適用)。
+#
+# 数値のみ(寸法値等)・1文字のみ(断面記号"A"/"B"等)のテキストは
+# 比較対象から除外する。前者は寸法値がコード名の数字部分に偶然部分一致
+# してしまうため(例: "441"が"TB441"に部分一致)、後者は断面記号の
+# 1文字が偶然コード名の末尾と一致してしまうため(例: "A"が"B60A"に、
+# "B"が"TB441"に部分一致してしまい、小梁47ファイル基準で6行の誤爆が
+# 発生したことで判明)。
+NEARBY_DUP_RANGE = 1000.0
+
+
+def _has_nearby_duplicate(tdf: tb.TdfData, mx: float, my: float, text: str) -> bool:
+    for rec in tdf.texts:
+        if abs(rec.x - mx) < 3 and abs(rec.y - my) < 3:
+            continue  # 長丸内の自分自身は除く
+        if abs(rec.x - mx) > NEARBY_DUP_RANGE or abs(rec.y - my) > NEARBY_DUP_RANGE:
+            continue
+        other = tdf.resolve_text(rec)
+        if not other:
+            continue
+        other_s = other.strip()
+        if other_s.isdigit():
+            continue  # 寸法値等の純粋な数値は比較対象外
+        if len(other_s) < 2:
+            continue  # 断面記号等の1文字ラベルは偶然の部分一致を起こすため対象外
+        if other == text or text in other or other in text:
+            return True
+    return False
+
+
 def assign_joints_batch(tdf: tb.TdfData, rows: list, tier_info: dict, lengths: dict) -> dict:
     """長丸(スタジアム形状)に囲まれたテキストは全て継手マークの一種である、
     という前提に立つ(2026-09-14、ユーザー確認: 大梁の`GJ`のような専用の
@@ -340,6 +380,12 @@ def assign_joints_batch(tdf: tb.TdfData, rows: list, tier_info: dict, lengths: d
     誤って奪ってしまう不具合と、1グループが複数の候補で「勝利」した際に
     距離を無視して辞書の反復順で上書きされてしまう不具合の両方を修正して
     確立した。
+
+    2026-09-15追加: 柱マーク(`P441`等)除外(`_has_nearby_duplicate`)。
+    大梁側で先に見つかった不具合(柱マークが長丸で囲まれ、継手候補として
+    誤って混入する)は小梁でも起こり得るため、同じ除外条件をこちらにも
+    適用した(小梁47ファイル基準では柱マーク混入は未発見だが、将来的な
+    横展開に備えた予防的措置)。
 
     `tier_info`(id(row) -> (段ラベル, y_max))・`lengths`(id(row) -> 長さ)は
     呼び出し側で計算済みのものを渡すこと。戻り値は id(row) -> (left, right)。
@@ -377,6 +423,13 @@ def assign_joints_batch(tdf: tb.TdfData, rows: list, tier_info: dict, lengths: d
             t = tdf.resolve_text(rec)
             if t:
                 candidates_raw.append((mx, my, t))
+    # 柱マーク除外(_has_nearby_duplicate)は製品長さがSHORT_PRODUCT_THRESHOLD
+    # 以上の場合にのみ適用する。製品が短いと、自己参照する左右の継手候補
+    # (同じテキストが左右の長丸に描かれるケース)同士が1000mm以内に収まり、
+    # お互いを「近傍重複」とみなして両方消えてしまう恐れがあるため
+    # (2026-09-15、ユーザー指摘)。事前に候補ごとの判定結果をキャッシュし、
+    # 短い製品の場合はこのキャッシュを参照しない(=除外条件を適用しない)。
+    dup_flags = {(mx, my, t): _has_nearby_duplicate(tdf, mx, my, t) for mx, my, t in candidates_raw}
 
     # (候補位置, テキスト, 側) ごとに、最も近いグループ(と距離)を記録する
     claims: dict[tuple, tuple] = {}
@@ -402,6 +455,7 @@ def assign_joints_batch(tdf: tb.TdfData, rows: list, tier_info: dict, lengths: d
         # リスクは無い(2026-09-14、EA1-1B-09のEA12-1B34-51・
         # EA12-1B29-52/53で確認)。
         threshold = max(length_value * 0.6, JOINT_MIN_THRESHOLD)
+        apply_dup_exclusion = length_value >= SHORT_PRODUCT_THRESHOLD
         for r in members:
             _tier_label, y_max = tier_info.get(id(r), (None, None))
             row_length = lengths.get(id(r))
@@ -426,6 +480,8 @@ def assign_joints_batch(tdf: tb.TdfData, rows: list, tier_info: dict, lengths: d
                 use_2d = False
             for mx, my, t in candidates_raw:
                 if my <= r.y or (y_max is not None and my >= y_max):
+                    continue
+                if apply_dup_exclusion and dup_flags[(mx, my, t)]:
                     continue
                 xr, yr = rotate(mx, my)
                 for side, ref in (("left", left_ref), ("right", right_ref)):
