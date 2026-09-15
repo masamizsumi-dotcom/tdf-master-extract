@@ -358,6 +358,12 @@ def _has_nearby_duplicate(tdf: tb.TdfData, mx: float, my: float, text: str) -> b
             continue  # 断面記号等の1文字ラベルは偶然の部分一致を起こすため対象外
         if other == text or text in other or other in text:
             return True
+        # 継手候補側に「J」が挿入されただけで、それ以外の文字は並び替えても
+        # 完全に一致する場合も柱マーク混入とみなす(2026-09-15、大梁側
+        # `extract_to_excel.py`のEA1-RG-13実例[`zPJ482`/`P482z`]で追加した
+        # ロジックを小梁側にも同期)。
+        if "J" in text and sorted(text.replace("J", "")) == sorted(other_s):
+            return True
     return False
 
 

@@ -140,6 +140,13 @@ def _has_nearby_duplicate(tdf, mx: float, my: float, text: str) -> bool:
             continue  # 断面記号等の1文字ラベルは偶然の部分一致を起こすため対象外
         if other == text or text in other or other in text:
             return True
+        # 継手候補側に「J」が挿入されただけで、それ以外の文字は並び替えても
+        # 完全に一致する場合も柱マーク混入とみなす(2026-09-15、EA1-RG-13の
+        # `zPJ482`(継手候補)と`P482z`(柱の実位置ラベル)の実例で追加。
+        # J以外の文字集合が一致すれば「柱マーク+J(継手を表す挿入文字)」と
+        # 判断する。textにJが含まれない場合は従来の判定のみで十分なため対象外)。
+        if "J" in text and sorted(text.replace("J", "")) == sorted(other_s):
+            return True
     return False
 
 
